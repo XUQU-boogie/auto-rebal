@@ -1,23 +1,23 @@
+import { Interface } from '@ethersproject/abi'
 import { BigNumber } from '@ethersproject/bignumber'
 import { Contract } from '@ethersproject/contracts'
-import { parseUnits } from '@ethersproject/units'
 import { JsonRpcProvider } from '@ethersproject/providers'
 import { Wallet } from '@ethersproject/wallet'
-import { Currency, CurrencyAmount, Price, Token, WETH9 } from '@uniswap/sdk-core'
+import { Token, WETH9 } from '@uniswap/sdk-core'
+import { abi as IUniswapV3PoolStateABI } from '@uniswap/v3-core/artifacts/contracts/interfaces/pool/IUniswapV3PoolState.sol/IUniswapV3PoolState.json'
 import { abi as NonfungiblePositionManagerABI } from '@uniswap/v3-periphery/artifacts/contracts/interfaces/INonfungiblePositionManager.sol/INonfungiblePositionManager.json'
-import { FeeAmount, Pool } from '@uniswap/v3-sdk'
+import { computePoolAddress, FeeAmount, Pool } from '@uniswap/v3-sdk'
 import { config } from 'dotenv'
-import { NonfungiblePositionManager } from './types/v3'
-import JSBI from 'jsbi'
+import { NonfungiblePositionManager, UniswapV3Pool } from './types/v3'
+import { IUniswapV3PoolStateInterface } from './types/v3/IUniswapV3PoolState'
 
 config({})
 
 enum CHAIN_ID {
   KOVAN = 42,
-  GOERLI = 5,
 }
 
-const UNISWAP_ADDRESSES = {
+const UNISWAP_ADDRESSES: Record<CHAIN_ID, Record<string, string>> = {
   [CHAIN_ID.KOVAN]: {
     coreFactory: '0x1F98431c8aD98523631AE4a59f267346ea31F984',
     weth9: '0xd0A1E359811322d97991E03f863a0C30C2cF029C',
@@ -33,12 +33,11 @@ const UNISWAP_ADDRESSES = {
   },
 }
 
-const DAI_ADDRESSES = {
+const DAI_ADDRESSES: Record<CHAIN_ID, string> = {
   [CHAIN_ID.KOVAN]: '0x4F96Fe3b7A6Cf9725f59d353F723c1bDb64CA6Aa',
 }
 
-const chainId = parseInt(process.env.chainId as unknown as string) || CHAIN_ID.KOVAN
-console.log(process.env.rpc, chainId)
+const chainId = (parseInt(process.env.chainId as unknown as string) || CHAIN_ID.KOVAN) as CHAIN_ID
 const provider = new JsonRpcProvider(process.env.rpc, chainId)
 const wallet = new Wallet(process.env.privateKey, provider)
 const account = wallet.address
@@ -59,29 +58,63 @@ interface Position {
   tokensOwed0: BigNumber
   tokensOwed1: BigNumber
 }
-function getActivePositionForPair(positions: Position[]) {
-  const addresses = [WETH9[chainId].address, DAI.address]
-  const relevantPositions = positions.filter(
-    (position) => addresses.includes(position.token0) && addresses.includes(position.token1)
-  )
-  // todo: get pool data and use it to check against the positions' ranges
-  const activePositions = relevantPositions.filter((position) => {
-    const below = pool && typeof tickLower === 'number' ? pool.tickCurrent < tickLower : undefined
-    const above = pool && typeof tickUpper === 'number' ? pool.tickCurrent >= tickUpper : undefined
-    const inRange: boolean = typeof below === 'boolean' && typeof above === 'boolean' ? !below && !above : false
-  })
-  return activePositions
-}
-function swapToFiftyFifty() {}
+
+const POOL_STATE_INTERFACE = new Interface(IUniswapV3PoolStateABI) as IUniswapV3PoolStateInterface
+const tokenA = WETH9[chainId]
+const tokenB = DAI
+const [token0, token1] = tokenA.sortsBefore(tokenB) ? [tokenA, tokenB] : [tokenB, tokenA]
 
 async function main() {
-  const poolAddress = Pool.getAddress(DAI, WETH, FeeAmount.MEDIUM)
+  const poolAddress = computePoolAddress({
+    factoryAddress: UNISWAP_ADDRESSES[chainId].coreFactory,
+    tokenA: token0,
+    tokenB: token1,
+    fee: FeeAmount.MEDIUM,
+  })
+  const PoolContract = new Contract(poolAddress, POOL_STATE_INTERFACE, wallet) as UniswapV3Pool
+
+  const slot0 = await PoolContract.slot0()
+  const liquidity = await PoolContract.liquidity()
+  const pool = new Pool(
+    token0,
+    token1,
+    FeeAmount.MEDIUM,
+    slot0.sqrtPriceX96.toString(),
+    liquidity.toString(),
+    slot0.tick
+  )
+
   const NonfungiblePositionManagerAddress = UNISWAP_ADDRESSES[chainId].NonfungiblePositionManager
   const NonfungiblePositionManagerContract = new Contract(
     NonfungiblePositionManagerAddress,
     NonfungiblePositionManagerABI,
     wallet
   ) as NonfungiblePositionManager
+  
+  async function getActivePositionsForPair(positions: Position[]) {
+    const addresses = [WETH9[chainId].address, DAI.address]
+    const relevantPositions = positions.filter(
+      (position) => addresses.includes(position.token0) && addresses.includes(position.token1)
+    )
+    return relevantPositions.filter(async (position) => {
+      try {
+        const below = pool && typeof position.tickLower === 'number' ? pool.tickCurrent < position.tickLower : undefined
+        const above =
+          pool && typeof position.tickUpper === 'number' ? pool.tickCurrent >= position.tickUpper : undefined
+        const inRange: boolean = typeof below === 'boolean' && typeof above === 'boolean' ? !below && !above : false
+        console.log('above, below, inRange', above, below, inRange)
+      } catch (e) {
+        console.error(e)
+      }
+    })
+  }
+  async function swapToFiftyFifty() {}
+  async function withdrawLiquidity() {
+    try {
+    } catch (e) {
+      console.error(e)
+    }
+  }
   const positionCount = await NonfungiblePositionManagerContract.balanceOf(account)
   const positionIdRequests = []
   for (let i = 0; i < positionCount.toNumber(); i++) {
@@ -94,8 +127,8 @@ async function main() {
     positionRequests.push(NonfungiblePositionManagerContract.positions(positionId))
   })
   const positions = await Promise.all(positionRequests as Promise<Position>[])
-  const activePairPosition = getActivePositionForPair(positions)
-  if (activePairPosition.length === 0) {
+  const activePairPositions = await getActivePositionsForPair(positions)
+  if (activePairPositions.length === 0) {
     //   ensure gas prices are median of gasnow fast and standard, less than 100
     //   withdraw liquidity
     //   swap to 50/50 USD value
@@ -123,7 +156,7 @@ async function main() {
 }
 
 main()
-  .then(() => process.exit(1))
+  .then(() => console.log('done'))
   .catch(async (e) => {
     console.log('=======================')
     console.error('error: process exited')
